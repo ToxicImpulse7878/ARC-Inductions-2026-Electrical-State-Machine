@@ -1,0 +1,307 @@
+// ID 2025AAPS2045H SLAVE CODE
+
+/*
+  =========================================================================
+  SLAVE ARDUINO  —  Display and Control Arduino
+  ARC Inductions 2026, Electrical Task 1
+  =========================================================================
+
+  Tinkercad link: TODO — paste the shared circuit link here before submitting.
+
+  ROLE
+  Owns the 16x2 I2C LCD and the IR receiver, per the repo's hardware
+  allocation. Holds no state machine logic: the master decides everything
+  and sends the result here to be rendered. This board's only upward
+  contribution is a decoded IR command byte, handed over when polled.
+
+  -------------------------------------------------------------------------
+  I2C PROTOCOL
+  -------------------------------------------------------------------------
+  Master -> slave, 4 bytes, fixed length, every 50 ms:
+      [0] state (0..5)
+      [1] display mode (0 = light, 1 = gas)
+      [2] ambient light percent (0..100)
+      [3] air purity percent (0..100)
+  Slave -> master, 1 byte on request:
+      0 = none, 1 = activate, 2 = toggle display, 3 = reset
+
+  -------------------------------------------------------------------------
+  TINKERCAD COMPONENT SETTINGS THAT MUST MATCH THIS CODE
+  -------------------------------------------------------------------------
+  Click the LCD component and check its properties panel:
+      Type    = PCF8574-based    <-- NOT MCP23008
+      Address = 32 (0x20)
+  The LiquidCrystal_I2C library targets the PCF8574. With the type set to
+  MCP23008 the display stays completely dark and silent, with no error:
+  the writes are acknowledged by a chip that interprets them differently.
+  A dark screen therefore does NOT rule out an addressing or type problem.
+
+  -------------------------------------------------------------------------
+  DESIGN DECISIONS WORTH DEFENDING
+  -------------------------------------------------------------------------
+  1. NOTHING TOUCHES THE LCD FROM INSIDE AN I2C CALLBACK. onReceive and
+     onRequest run in interrupt context with interrupts disabled. An
+     lcd.* call starts a NEW master transaction from there and deadlocks
+     the bus. Wire.write() inside onRequest is different and is fine — it
+     feeds the transaction already in progress rather than starting one.
+
+  2. REPEAT FRAMES ARE FILTERED ON THE FLAG, NOT THE COMMAND VALUE.
+     Measured in Tinkercad: holding one button emits roughly nine NEC
+     repeat frames per second. Their decodedRawData is 0 but
+     decodedIRData.command still carries the ORIGINAL command, so testing
+     the value would let every one of them through.
+
+  3. A SECOND COMMAND ARRIVING BEFORE THE MASTER POLLS IS DROPPED, NOT
+     OVERWRITTEN. With a 50 ms poll and a 200 ms debounce, anything landing
+     inside that window is far likelier to be noise than a distinct
+     intent, so the press we trust is the one we keep.
+
+  4. LINES ARE SPACE-PADDED TO 16 RATHER THAN CLEARED. lcd.clear() is slow
+     and visibly flickers on every update; without padding, leftovers from
+     a longer previous string persist ("NOCTIS PROTOCOL" followed by
+     "COOKED" would read "COOKEDROTOCOL").
+
+  5. THE MULTI-FAULT STRING IS REWORDED. The spec's "MULTIPLE PROBLEMS
+     DETECTED" is 26 characters; a 16x2 panel cannot show it on one line,
+     and the natural split leaves 17 characters on the second. Rendered as
+     ">1 PROBLEMS" / "DETECTED" to fit. Deliberate change, not a typo.
+  -------------------------------------------------------------------------
+*/
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <IRremote.h>
+
+// ---------- CONFIGURATION ----------
+const uint8_t SLAVE_ADDRESS = 8;
+const uint8_t LCD_ADDRESS   = 0x20;   // Tinkercad shows this as 32
+const int     PIN_IR        = 2;
+
+LiquidCrystal_I2C lcd(LCD_ADDRESS, 16, 2);
+
+// ---------- STATE CODES (must match the master exactly) ----------
+const uint8_t STANDBY           = 0;
+const uint8_t ACTIVE_MONITORING = 1;
+const uint8_t GAS_ALERT         = 2;
+const uint8_t BLACKOUT_ALERT    = 3;
+const uint8_t TEMP_EMERGENCY    = 4;
+const uint8_t MULTI_FAULT       = 5;
+const uint8_t TEMP_MULTI_FAULT  = 6;   // extension beyond the spec; see master
+
+// ---------- COMMAND CODES (must match the master exactly) ----------
+const uint8_t CMD_NONE     = 0;
+const uint8_t CMD_ACTIVATE = 1;
+const uint8_t CMD_TOGGLE   = 2;
+const uint8_t CMD_RESET    = 3;
+
+// ---------- IR BUTTON MAPPING ----------
+// Captured from Tinkercad's remote with a probe sketch.
+// The power button only ever activates; the spec defines no deactivate
+// command, so pressing it again is ignored by the master.
+const uint8_t IR_CODE_ACTIVATE = 0x00;   // power button
+const uint8_t IR_CODE_TOGGLE   = 0x09;   // volume down
+const uint8_t IR_CODE_RESET    = 0x0C;   // the "0" key
+
+const unsigned long IR_DEBOUNCE_MS = 200;
+
+// ---------- SHARED WITH INTERRUPT CONTEXT ----------
+volatile uint8_t pendingCommand = CMD_NONE;
+volatile uint8_t rxBuffer[4]    = {STANDBY, 0, 0, 0};
+volatile bool    newDataReady   = false;
+
+// ---------- LAST RENDERED PAYLOAD (change detection) ----------
+uint8_t lastState = 255;   // impossible value forces a render on first pass
+uint8_t lastMode  = 255;
+uint8_t lastLight = 255;
+uint8_t lastGas   = 255;
+
+unsigned long lastIRAccepted = 0;
+
+// =========================================================================
+void setup() {
+  Serial.begin(9600);
+
+  lcd.init();
+  lcd.backlight();
+
+  IrReceiver.begin(PIN_IR, ENABLE_LED_FEEDBACK);
+
+  Wire.begin(SLAVE_ADDRESS);        // with an address = join as SLAVE
+  Wire.onReceive(receiveEvent);
+  Wire.onRequest(requestEvent);
+
+  // Deliberately NOT writing to the LCD here. Wire.begin() has already
+  // registered the I2C callbacks above, so a poll from the master can land
+  // inside these writes and crash the board — observed as a reset loop
+  // printing "Slave ready." once per second. The first real render happens
+  // in loop() once a payload arrives, which is safe.
+  // writeLine(0, "BOOTING");
+  // writeLine(1, "");
+
+  Serial.println(F("Slave ready."));
+}
+
+// =========================================================================
+void loop() {
+  handleIR();
+  handleDisplay();
+}
+
+// =========================================================================
+// I2C CALLBACKS — interrupt context. Touch variables only. No lcd.* here.
+// =========================================================================
+
+void receiveEvent(int howMany) {
+  uint8_t i = 0;
+  while (Wire.available() && i < 4) {
+    rxBuffer[i++] = Wire.read();
+  }
+  while (Wire.available()) {   // drain anything unexpected so the next
+    Wire.read();               // packet starts cleanly aligned
+  }
+  if (i == 4) {
+    newDataReady = true;
+  }
+}
+
+void requestEvent() {
+  Wire.write(pendingCommand);
+  pendingCommand = CMD_NONE;   // cleared only once the master has read it
+}
+
+// =========================================================================
+// IR HANDLING
+// =========================================================================
+
+void handleIR() {
+  if (!IrReceiver.decode()) {
+    return;
+  }
+
+  bool isRepeat = IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT;
+
+  if (!isRepeat) {
+    uint8_t cmd = mapIRToCommand(IrReceiver.decodedIRData.command);
+
+    if (cmd != CMD_NONE && (millis() - lastIRAccepted >= IR_DEBOUNCE_MS)) {
+      if (pendingCommand == CMD_NONE) {
+        pendingCommand = cmd;
+        lastIRAccepted = millis();
+        Serial.print(F("IR command queued: "));
+        Serial.println(cmd);
+      }
+    }
+  }
+
+  IrReceiver.resume();
+}
+
+uint8_t mapIRToCommand(uint8_t irCode) {
+  if (irCode == IR_CODE_ACTIVATE) return CMD_ACTIVATE;
+  if (irCode == IR_CODE_TOGGLE)   return CMD_TOGGLE;
+  if (irCode == IR_CODE_RESET)    return CMD_RESET;
+  return CMD_NONE;   // every other button is ignored
+}
+
+// =========================================================================
+// DISPLAY
+// =========================================================================
+
+void handleDisplay() {
+  if (!newDataReady) {
+    return;
+  }
+
+  // Copy out of the volatile buffer with interrupts off, so a poll landing
+  // mid-copy cannot hand us half of one packet and half of the next.
+  uint8_t state, mode, lightPct, gasPct;
+  noInterrupts();
+  state    = rxBuffer[0];
+  mode     = rxBuffer[1];
+  lightPct = rxBuffer[2];
+  gasPct   = rxBuffer[3];
+  newDataReady = false;
+  interrupts();
+
+  // Re-render only on an actual change. Without this the LCD is rewritten
+  // every 50 ms, flooding the bus for no visible benefit.
+  if (state == lastState && mode == lastMode &&
+      lightPct == lastLight && gasPct == lastGas) {
+    return;
+  }
+  lastState = state;
+  lastMode  = mode;
+  lastLight = lightPct;
+  lastGas   = gasPct;
+
+  renderState(state, mode, lightPct, gasPct);
+}
+
+void renderState(uint8_t state, uint8_t mode, uint8_t lightPct, uint8_t gasPct) {
+  char buf[17];
+
+  switch (state) {
+    case STANDBY:
+      writeLine(0, "AWAITING RITUAL");
+      writeLine(1, "");
+      break;
+
+    case ACTIVE_MONITORING:
+      writeLine(0, "MONITORING");
+      if (mode == 0) {
+        snprintf(buf, sizeof(buf), "Light: %u%%", lightPct);
+      } else {
+        snprintf(buf, sizeof(buf), "Air Purity:%u%%", gasPct);
+      }
+      writeLine(1, buf);
+      break;
+
+    case GAS_ALERT:
+      writeLine(0, "TOXIC PURGE");
+      writeLine(1, "");
+      break;
+
+    case BLACKOUT_ALERT:
+      writeLine(0, "NOCTIS PROTOCOL");
+      writeLine(1, "");
+      break;
+
+    case TEMP_EMERGENCY:
+      writeLine(0, "COOKED");
+      writeLine(1, "");
+      break;
+
+    case MULTI_FAULT:
+      writeLine(0, ">1 PROBLEMS");
+      writeLine(1, "DETECTED");
+      break;
+
+    // Temperature plus at least one other fault. Not a spec state — added
+    // deliberately. Worded ">1 & TEMP PROBS" / "DETECTED" (15 and 8 chars)
+    // to fit 16x2 and stay parallel with the multi-fault wording above.
+    case TEMP_MULTI_FAULT:
+      writeLine(0, ">1 & TEMP PROBS");
+      writeLine(1, "DETECTED");
+      break;
+
+    default:
+      writeLine(0, "UNKNOWN STATE");
+      writeLine(1, "");
+      break;
+  }
+}
+
+// Writes exactly 16 characters, space-padded.
+void writeLine(uint8_t row, const char* text) {
+  lcd.setCursor(0, row);
+  uint8_t i = 0;
+  while (i < 16 && text[i] != '\0') {
+    lcd.print(text[i]);
+    i++;
+  }
+  while (i < 16) {
+    lcd.print(' ');
+    i++;
+  }
+}
+
