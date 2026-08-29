@@ -1,0 +1,768 @@
+
+Tinkercad Task link (2025AAPS2045H) :- https://www.tinkercad.com/things/ceM4hTeuHke-arduinomasterandslave2025aaps2045h
+
+
+/*
+  =========================================================================
+  MASTER ARDUINO  —  Sensor Arduino
+  ARC Inductions 2026, Electrical Task 1
+  =========================================================================
+
+  Tinkercad link: TODO — paste the shared circuit link here before submitting.
+
+  ROLE
+  Owns the photoresistor, gas sensor, temperature sensor, servo and piezo
+  buzzer. Runs the entire state machine. The slave Arduino owns the LCD and
+  the IR receiver and holds no logic of its own — it renders what it is told
+  and reports IR button presses when polled.
+
+  -------------------------------------------------------------------------
+  I2C PROTOCOL
+  -------------------------------------------------------------------------
+  Master -> slave, 4 bytes, fixed length, every 50 ms:
+      [0] state (0..5)
+      [1] display mode (0 = light, 1 = gas)
+      [2] ambient light percent (0..100)
+      [3] air purity percent (0..100)
+  Slave -> master, 1 byte on request:
+      0 = none, 1 = activate, 2 = toggle display, 3 = reset
+
+  Fixed length so the slave never parses. Logical command codes rather than
+  raw IR values, so remapping a remote button touches only the slave.
+
+  -------------------------------------------------------------------------
+  DESIGN DECISIONS WORTH DEFENDING
+  -------------------------------------------------------------------------
+  1. FAULT LATCHES ARE UPDATED UNCONDITIONALLY. Each update function is
+     called every loop pass with the threshold test INSIDE it. Wrapping the
+     call in a condition would let a latch set but never clear.
+
+  2. TEMPERATURE IS NOT GATED ON ACTIVATION. The spec says State 4
+     "strictly overrides States 0, 1, 2 and 3" — State 0 is Standby, so a
+     temperature emergency must fire even before the system is switched on.
+     Gas and light ARE gated, because State 0 says sensors are "powered but
+     inactive" and State 1 is where polling begins.
+
+  3. BLACKOUT SUPPRESSES IR BY STATE, NOT BY FLAG. Suppressing on
+     lightFaultLatched would deadlock the system: the latch can be set in
+     Standby, and IR is the only way to activate. See checkIRCommands().
+
+  4. RESET IS REFUSED WHILE THE ROOM IS STILL HOT. Clearing the latch at
+     50 C would just re-latch on the next pass, silently swallowing the
+     user's command. Refusing it and saying so is more honest.
+
+  5. NO DEACTIVATE COMMAND. The spec defines only three IR commands:
+     activate, display toggle, and reset. Standby is therefore reachable
+     only at power-on. An earlier draft had a deactivate command; it was
+     removed to match the spec exactly.
+
+  6. STATES ARE uint8_t CONSTANTS, NOT AN enum. The Arduino build system
+     auto-generates function prototypes and inserts them above user type
+     definitions, so any signature mentioning a user-defined type fails to
+     compile. The usual fix is a separate header, which Tinkercad does not
+     allow. Cost: no compile-time type checking on state arguments.
+
+  7. THRESHOLDS COMPARE RAW ADC COUNTS; THE LCD SHOWS PERCENTAGES. The spec
+     gives gas limits in raw "units" (180/130) but asks the display for
+     percentages. Temperature is converted to Celsius before comparison
+     because its threshold is given in Celsius.
+
+  -------------------------------------------------------------------------
+  KNOWN COMPROMISE
+  -------------------------------------------------------------------------
+  The repo assigns the LCD to the slave, and the LCD is an I2C part, so the
+  slave must act as a master to the display while remaining a slave to this
+  board. Two masters share one SDA/SCL pair. AVR TWI supports multi-master
+  arbitration but the Wire library handles it poorly on real hardware.
+  Accepted deliberately for the addendum's extra-credit I2C screen.
+  -------------------------------------------------------------------------
+*/
+
+#include <Servo.h>
+#include <Wire.h>
+
+// ---------- PIN DEFINITIONS ----------
+const int PIN_LDR         = A0;
+const int PIN_GAS_SENSOR  = A1;
+const int PIN_TEMP_SENSOR = A2;
+const int PIN_SERVO       = 9;
+const int PIN_BUZZER      = 8;
+// A4 = SDA and A5 = SCL are used by the I2C bus. Never wire anything else
+// to them and never ground them.
+
+// ---------- I2C ----------
+const uint8_t SLAVE_ADDRESS      = 8;
+const unsigned long I2C_INTERVAL = 250;  // ms between polls
+// 250 rather than 50, found empirically. At 50 ms the master's polls landed
+// inside the slave's LCD writes often enough to corrupt characters
+// ("AWAITING RITUA", "BOOTö≷r"). Polling less often makes collisions rare.
+// The display only redraws on change, so nothing is lost by the slower rate.
+unsigned long lastI2CService     = 0;
+
+// ---------- STATE CODES (must match the slave exactly) ----------
+const uint8_t STANDBY           = 0;
+const uint8_t ACTIVE_MONITORING = 1;
+const uint8_t GAS_ALERT         = 2;
+const uint8_t BLACKOUT_ALERT    = 3;
+const uint8_t TEMP_EMERGENCY    = 4;
+const uint8_t MULTI_FAULT       = 5;
+// EXTENSION BEYOND THE SPEC. The repo defines Multi-Fault as States 2+3
+// "(excluding State 4)", so a temperature emergency alongside another fault
+// is, per the spec, still plain TEMP_EMERGENCY. This extra state was added
+// deliberately to surface the compound case on the LCD. It sits ABOVE
+// TEMP_EMERGENCY in priority and keeps every State 4 action (vent open),
+// so it strengthens rather than weakens the emergency response.
+const uint8_t TEMP_MULTI_FAULT  = 6;
+
+uint8_t currentState  = STANDBY;
+uint8_t previousState = 255;   // impossible value forces one log on first pass
+
+// ---------- COMMAND CODES (must match the slave exactly) ----------
+const uint8_t CMD_NONE     = 0;
+const uint8_t CMD_ACTIVATE = 1;
+const uint8_t CMD_TOGGLE   = 2;
+const uint8_t CMD_RESET    = 3;
+
+uint8_t pendingIRCommand = CMD_NONE;
+
+// ---------- FAULT AND CONTROL FLAGS ----------
+bool activated            = false;
+bool showGasOnLCD         = false;   // false = light levels, true = air purity
+bool gasFaultLatched      = false;
+bool lightFaultLatched    = false;
+bool tempFaultLatched     = false;
+bool resetCommandReceived = false;
+
+// ---------- SENSOR READINGS, refreshed once per loop pass ----------
+int   gasReading   = 0;     // raw ADC, 0..1023
+int   lightReading = 0;     // raw ADC, 0..1023
+float tempC        = 0.0;   // degrees Celsius, already converted
+
+// ---------- THRESHOLDS ----------
+const int   GAS_TRIGGER_ON    = 180;   // raw ADC, from the spec
+const int   GAS_TRIGGER_OFF   = 130;   // raw ADC, from the spec
+// Calibrated against this circuit's LDR + 10k divider: 6 raw in full dark,
+// 679 raw at full brightness. Thresholds sit well inside that span, with a
+// wide gap between them so the blackout state cannot chatter at the boundary.
+const int   LIGHT_TRIGGER_ON  = 150;   // raw ADC, calibrated
+const int   LIGHT_TRIGGER_OFF = 450;   // raw ADC, calibrated
+const float TEMP_TRIGGER_ON   = 45.0;  // degrees Celsius, from the spec
+
+const int SERVO_RESTING = 0;
+const int SERVO_VENTING = 180;
+const int BUZZER_TONE_HZ = 1000;
+
+Servo ventServo;
+
+// =========================================================================
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(PIN_BUZZER, OUTPUT);
+  noTone(PIN_BUZZER);
+
+  ventServo.attach(PIN_SERVO);
+  ventServo.write(SERVO_RESTING);
+
+  Wire.begin();   // no argument = join the bus as MASTER
+
+  Serial.println(F("Master ready."));
+}
+
+// =========================================================================
+void loop() {
+  // 1. INPUTS FIRST. Commands must be consumed before the flags that
+  //    depend on them are evaluated, or a reset arrives one pass too late.
+  checkIRCommands();
+
+  // 2. UPDATE EVERY FAULT FLAG, EVERY PASS, NO EXCEPTIONS.
+  updateGasFault();
+  updateLightFault();
+  updateTempFault();
+
+  // 3. DECIDE.
+  currentState = decideState();
+
+  // 4. ACT on the master's own actuators.
+  executeStateActions(currentState);
+
+  // 5. LOG TRANSITIONS ONLY. Satisfies State 3's "logs the event", and
+  //    keeps the serial monitor readable instead of thousands of
+  //    identical lines per second.
+  if (currentState != previousState) {
+    Serial.print(F("State -> "));
+    Serial.println(stateName(currentState));
+    previousState = currentState;
+  }
+
+  // 6. I2C SERVICE, RATE LIMITED. Wire calls block for a few hundred
+  //    microseconds each; running them every pass would collapse the loop
+  //    rate and quietly reintroduce delay() under another name.
+  if (millis() - lastI2CService >= I2C_INTERVAL) {
+    lastI2CService = millis();
+    serviceI2C();
+  }
+}
+
+// =========================================================================
+// FAULT DETECTION — each function is a self-contained hysteresis latch.
+// =========================================================================
+
+void updateGasFault() {
+  gasReading = readGasSensor();
+
+  if (gasReading > GAS_TRIGGER_ON) {
+    gasFaultLatched = true;
+  } else if (gasReading < GAS_TRIGGER_OFF) {
+    gasFaultLatched = false;
+  }
+  // Between the two thresholds the latch holds its previous value. That
+  // dead zone is the hysteresis band; it stops the flag chattering on a
+  // reading hovering at the limit. It also implements the spec's
+  // "stays in this state until gas drops below 130, returning
+  // automatically to State 1".
+}
+
+void updateLightFault() {
+  lightReading = readLightSensor();
+
+  // Comparisons are inverted relative to gas: LOW light is the fault, so
+  // TRIGGER_ON is the smaller number here.
+  //
+  // INTERPRETATION NOTE: the spec says "a sudden, absolute drop in ambient
+  // light". This is implemented as a level test with hysteresis rather
+  // than a rate-of-change detector, because light changes in Tinkercad are
+  // always step changes from a slider, never gradual. Known consequence: a
+  // room that is already dark at power-on latches immediately, where a
+  // rate detector would not.
+  if (lightReading < LIGHT_TRIGGER_ON) {
+    lightFaultLatched = true;
+  } else if (lightReading > LIGHT_TRIGGER_OFF) {
+    lightFaultLatched = false;
+  }
+}
+
+void updateTempFault() {
+  tempC = readTempSensor();
+
+  if (tempC > TEMP_TRIGGER_ON) {
+    tempFaultLatched = true;
+  }
+  // Deliberately no automatic clear. Per the spec, State 4 "requires a
+  // manual reset command sent via the IR remote to exit this state".
+
+  if (resetCommandReceived) {
+    if (tempC <= TEMP_TRIGGER_ON) {
+      tempFaultLatched = false;
+      Serial.println(F("Temp latch cleared by reset."));
+    } else {
+      // Without this guard the latch would clear and immediately re-set
+      // from the still-high reading on the next pass, swallowing the
+      // command with no feedback.
+      Serial.println(F("Reset refused: temperature still above threshold."));
+    }
+    resetCommandReceived = false;   // consumed either way, so a refused
+                                    // reset cannot fire later on its own
+  }
+}
+
+// =========================================================================
+// STATE ARBITRATION — one linear priority chain, evaluated fresh each pass.
+// =========================================================================
+
+uint8_t decideState() {
+  // Temperature plus at least one other fault. Extension beyond the spec —
+  // see the note by TEMP_MULTI_FAULT. Placed above TEMP_EMERGENCY so the
+  // compound case is reported rather than hidden behind it.
+  if (tempFaultLatched && (gasFaultLatched || lightFaultLatched)) {
+    return TEMP_MULTI_FAULT;
+  }
+
+  // State 4 overrides States 0-3, Standby included, so this sits above the
+  // activation gate.
+  if (tempFaultLatched) {
+    return TEMP_EMERGENCY;
+  }
+
+  if (!activated) {
+    return STANDBY;
+  }
+
+  if (gasFaultLatched && lightFaultLatched) {
+    return MULTI_FAULT;
+  } else if (gasFaultLatched) {
+    return GAS_ALERT;
+  } else if (lightFaultLatched) {
+    return BLACKOUT_ALERT;
+  } else {
+    return ACTIVE_MONITORING;
+  }
+}
+
+// =========================================================================
+// ACTION EXECUTION — master-owned actuators only.
+// =========================================================================
+
+void executeStateActions(uint8_t state) {
+  // Servo opens the vent during ANY temperature emergency, compound or not.
+  // Critical: if TEMP_MULTI_FAULT were omitted here, the vent would close
+  // exactly when conditions are worst — overheating plus a second fault.
+  if (state == TEMP_EMERGENCY || state == TEMP_MULTI_FAULT) {
+    ventServo.write(SERVO_VENTING);
+  } else {
+    ventServo.write(SERVO_RESTING);
+  }
+
+  // Buzzer sounds continuously only during a multi-fault.
+  //
+  // tone() rather than digitalWrite(HIGH): a piezo responds to an
+  // alternating voltage, not a steady one. A constant HIGH produces a
+  // single click and then silence. tone() uses Timer2 while the Servo
+  // library uses Timer1, so the two do not conflict on an Uno.
+  if (state == MULTI_FAULT || state == TEMP_MULTI_FAULT) {
+    tone(PIN_BUZZER, BUZZER_TONE_HZ);
+  } else {
+    noTone(PIN_BUZZER);
+  }
+}
+
+// =========================================================================
+// SENSOR READING
+// =========================================================================
+
+int readGasSensor() {
+  return analogRead(PIN_GAS_SENSOR);   // raw ADC; thresholds are also raw
+}
+
+int readLightSensor() {
+  return analogRead(PIN_LDR);          // raw ADC; thresholds are also raw
+}
+
+float readTempSensor() {
+  // The analog pin measures VOLTAGE, not heat, and reports it as 0..1023.
+  // Comparing that count directly against 45 would latch a temperature
+  // emergency at room temperature, because room temperature reads ~147.
+  int raw     = analogRead(PIN_TEMP_SENSOR);
+  float volts = raw * (5.0 / 1024.0);
+  return (volts - 0.5) * 100.0;   // TMP36: 500 mV offset at 0 C, 10 mV per C
+}
+
+// =========================================================================
+// IR COMMAND HANDLING
+// =========================================================================
+
+void checkIRCommands() {
+  // State 3: "ignores standard IR commands until lighting is restored."
+  //
+  // Gated on the STATE rather than on lightFaultLatched. The latch can
+  // already be set while in Standby, since the update functions run
+  // unconditionally, and IR is the only way to activate the system —
+  // gating on the flag would make a dark room a permanent lockout.
+  if (currentState == BLACKOUT_ALERT || currentState == MULTI_FAULT) {
+    pendingIRCommand = CMD_NONE;   // dropped, not queued: it must not fire
+    return;                        // later once lighting is restored
+  }
+
+  if (pendingIRCommand == CMD_NONE) {
+    return;
+  }
+
+  switch (pendingIRCommand) {
+    case CMD_ACTIVATE: enterActive();               break;
+    case CMD_TOGGLE:   toggleDisplayMode();         break;
+    case CMD_RESET:    resetCommandReceived = true; break;
+  }
+  pendingIRCommand = CMD_NONE;
+}
+
+// Clears any latch set while the system was switched off, so monitoring
+// starts from a clean slate rather than instantly alarming on a stale
+// event. Matters most for temperature, which has no automatic clear and
+// would otherwise carry a fault across the entire off period.
+void enterActive() {
+  if (activated) return;   // already on; ignore repeat presses, which
+                           // would otherwise wipe live faults
+
+  gasFaultLatched      = false;
+  lightFaultLatched    = false;
+  tempFaultLatched     = false;
+  resetCommandReceived = false;
+
+  activated = true;
+  Serial.println(F("Activated — latches cleared, monitoring live."));
+}
+
+void toggleDisplayMode() {
+  showGasOnLCD = !showGasOnLCD;
+  Serial.print(F("LCD mode -> "));
+  Serial.println(showGasOnLCD ? F("GAS") : F("LIGHT"));
+}
+
+// =========================================================================
+// I2C SERVICE — called on a timer, never every pass.
+// =========================================================================
+
+void serviceI2C() {
+  // (a) PULL the slave's pending IR command. The slave clears its slot
+  //     only inside its onRequest handler, so a command cannot be lost to
+  //     a poll that never happens.
+  uint8_t received = CMD_NONE;
+  if (Wire.requestFrom((uint8_t)SLAVE_ADDRESS, (uint8_t)1) == 1) {
+    received = Wire.read();
+  }
+  if (received != CMD_NONE) {
+    pendingIRCommand = received;
+  }
+
+  // (b) PUSH the display payload. Every value cast explicitly: Wire.write()
+  //     is overloaded and a bare integer expression can compile as an
+  //     ambiguous call.
+  Wire.beginTransmission(SLAVE_ADDRESS);
+  Wire.write((uint8_t)currentState);
+  Wire.write((uint8_t)(showGasOnLCD ? 1 : 0));
+  Wire.write((uint8_t)lightPercent());
+  Wire.write((uint8_t)purityPercent());
+  Wire.endTransmission();
+}
+
+// =========================================================================
+// DISPLAY UNIT CONVERSIONS
+// =========================================================================
+
+uint8_t lightPercent() {
+  long pct = map(lightReading, 0, 1023, 0, 100);
+  return (uint8_t)constrain(pct, 0, 100);
+}
+
+// Air PURITY is the inverse of the gas reading: a high gas reading means
+// dirty air. Passing the raw value straight through would show high purity
+// during a gas alert.
+uint8_t purityPercent() {
+  long pct = 100 - map(gasReading, 0, 1023, 0, 100);
+  return (uint8_t)constrain(pct, 0, 100);
+}
+
+// =========================================================================
+// UTILITY
+// =========================================================================
+
+const char* stateName(uint8_t s) {
+  switch (s) {
+    case STANDBY:           return "STANDBY";
+    case ACTIVE_MONITORING: return "ACTIVE_MONITORING";
+    case GAS_ALERT:         return "GAS_ALERT";
+    case BLACKOUT_ALERT:    return "BLACKOUT_ALERT";
+    case TEMP_EMERGENCY:    return "TEMP_EMERGENCY";
+    case MULTI_FAULT:       return "MULTI_FAULT";
+    case TEMP_MULTI_FAULT:  return "TEMP_MULTI_FAULT";
+    default:                return "UNKNOWN";
+  }
+}
+
+
+Slave code.
+/*
+  =========================================================================
+  SLAVE ARDUINO  —  Display and Control Arduino
+  ARC Inductions 2026, Electrical Task 1
+  =========================================================================
+
+  Tinkercad link: TODO — paste the shared circuit link here before submitting.
+
+  ROLE
+  Owns the 16x2 I2C LCD and the IR receiver, per the repo's hardware
+  allocation. Holds no state machine logic: the master decides everything
+  and sends the result here to be rendered. This board's only upward
+  contribution is a decoded IR command byte, handed over when polled.
+
+  -------------------------------------------------------------------------
+  I2C PROTOCOL
+  -------------------------------------------------------------------------
+  Master -> slave, 4 bytes, fixed length, every 50 ms:
+      [0] state (0..5)
+      [1] display mode (0 = light, 1 = gas)
+      [2] ambient light percent (0..100)
+      [3] air purity percent (0..100)
+  Slave -> master, 1 byte on request:
+      0 = none, 1 = activate, 2 = toggle display, 3 = reset
+
+  -------------------------------------------------------------------------
+  TINKERCAD COMPONENT SETTINGS THAT MUST MATCH THIS CODE
+  -------------------------------------------------------------------------
+  Click the LCD component and check its properties panel:
+      Type    = PCF8574-based    <-- NOT MCP23008
+      Address = 32 (0x20)
+  The LiquidCrystal_I2C library targets the PCF8574. With the type set to
+  MCP23008 the display stays completely dark and silent, with no error:
+  the writes are acknowledged by a chip that interprets them differently.
+  A dark screen therefore does NOT rule out an addressing or type problem.
+
+  -------------------------------------------------------------------------
+  DESIGN DECISIONS WORTH DEFENDING
+  -------------------------------------------------------------------------
+  1. NOTHING TOUCHES THE LCD FROM INSIDE AN I2C CALLBACK. onReceive and
+     onRequest run in interrupt context with interrupts disabled. An
+     lcd.* call starts a NEW master transaction from there and deadlocks
+     the bus. Wire.write() inside onRequest is different and is fine — it
+     feeds the transaction already in progress rather than starting one.
+
+  2. REPEAT FRAMES ARE FILTERED ON THE FLAG, NOT THE COMMAND VALUE.
+     Measured in Tinkercad: holding one button emits roughly nine NEC
+     repeat frames per second. Their decodedRawData is 0 but
+     decodedIRData.command still carries the ORIGINAL command, so testing
+     the value would let every one of them through.
+
+  3. A SECOND COMMAND ARRIVING BEFORE THE MASTER POLLS IS DROPPED, NOT
+     OVERWRITTEN. With a 50 ms poll and a 200 ms debounce, anything landing
+     inside that window is far likelier to be noise than a distinct
+     intent, so the press we trust is the one we keep.
+
+  4. LINES ARE SPACE-PADDED TO 16 RATHER THAN CLEARED. lcd.clear() is slow
+     and visibly flickers on every update; without padding, leftovers from
+     a longer previous string persist ("NOCTIS PROTOCOL" followed by
+     "COOKED" would read "COOKEDROTOCOL").
+
+  5. THE MULTI-FAULT STRING IS REWORDED. The spec's "MULTIPLE PROBLEMS
+     DETECTED" is 26 characters; a 16x2 panel cannot show it on one line,
+     and the natural split leaves 17 characters on the second. Rendered as
+     ">1 PROBLEMS" / "DETECTED" to fit. Deliberate change, not a typo.
+  -------------------------------------------------------------------------
+*/
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <IRremote.h>
+
+// ---------- CONFIGURATION ----------
+const uint8_t SLAVE_ADDRESS = 8;
+const uint8_t LCD_ADDRESS   = 0x20;   // Tinkercad shows this as 32
+const int     PIN_IR        = 2;
+
+LiquidCrystal_I2C lcd(LCD_ADDRESS, 16, 2);
+
+// ---------- STATE CODES (must match the master exactly) ----------
+const uint8_t STANDBY           = 0;
+const uint8_t ACTIVE_MONITORING = 1;
+const uint8_t GAS_ALERT         = 2;
+const uint8_t BLACKOUT_ALERT    = 3;
+const uint8_t TEMP_EMERGENCY    = 4;
+const uint8_t MULTI_FAULT       = 5;
+const uint8_t TEMP_MULTI_FAULT  = 6;   // extension beyond the spec; see master
+
+// ---------- COMMAND CODES (must match the master exactly) ----------
+const uint8_t CMD_NONE     = 0;
+const uint8_t CMD_ACTIVATE = 1;
+const uint8_t CMD_TOGGLE   = 2;
+const uint8_t CMD_RESET    = 3;
+
+// ---------- IR BUTTON MAPPING ----------
+// Captured from Tinkercad's remote with a probe sketch.
+// The power button only ever activates; the spec defines no deactivate
+// command, so pressing it again is ignored by the master.
+const uint8_t IR_CODE_ACTIVATE = 0x00;   // power button
+const uint8_t IR_CODE_TOGGLE   = 0x09;   // volume down
+const uint8_t IR_CODE_RESET    = 0x0C;   // the "0" key
+
+const unsigned long IR_DEBOUNCE_MS = 200;
+
+// ---------- SHARED WITH INTERRUPT CONTEXT ----------
+volatile uint8_t pendingCommand = CMD_NONE;
+volatile uint8_t rxBuffer[4]    = {STANDBY, 0, 0, 0};
+volatile bool    newDataReady   = false;
+
+// ---------- LAST RENDERED PAYLOAD (change detection) ----------
+uint8_t lastState = 255;   // impossible value forces a render on first pass
+uint8_t lastMode  = 255;
+uint8_t lastLight = 255;
+uint8_t lastGas   = 255;
+
+unsigned long lastIRAccepted = 0;
+
+// =========================================================================
+void setup() {
+  Serial.begin(9600);
+
+  lcd.init();
+  lcd.backlight();
+
+  IrReceiver.begin(PIN_IR, ENABLE_LED_FEEDBACK);
+
+  Wire.begin(SLAVE_ADDRESS);        // with an address = join as SLAVE
+  Wire.onReceive(receiveEvent);
+  Wire.onRequest(requestEvent);
+
+  // Deliberately NOT writing to the LCD here. Wire.begin() has already
+  // registered the I2C callbacks above, so a poll from the master can land
+  // inside these writes and crash the board — observed as a reset loop
+  // printing "Slave ready." once per second. The first real render happens
+  // in loop() once a payload arrives, which is safe.
+  // writeLine(0, "BOOTING");
+  // writeLine(1, "");
+
+  Serial.println(F("Slave ready."));
+}
+
+// =========================================================================
+void loop() {
+  handleIR();
+  handleDisplay();
+}
+
+// =========================================================================
+// I2C CALLBACKS — interrupt context. Touch variables only. No lcd.* here.
+// =========================================================================
+
+void receiveEvent(int howMany) {
+  uint8_t i = 0;
+  while (Wire.available() && i < 4) {
+    rxBuffer[i++] = Wire.read();
+  }
+  while (Wire.available()) {   // drain anything unexpected so the next
+    Wire.read();               // packet starts cleanly aligned
+  }
+  if (i == 4) {
+    newDataReady = true;
+  }
+}
+
+void requestEvent() {
+  Wire.write(pendingCommand);
+  pendingCommand = CMD_NONE;   // cleared only once the master has read it
+}
+
+// =========================================================================
+// IR HANDLING
+// =========================================================================
+
+void handleIR() {
+  if (!IrReceiver.decode()) {
+    return;
+  }
+
+  bool isRepeat = IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT;
+
+  if (!isRepeat) {
+    uint8_t cmd = mapIRToCommand(IrReceiver.decodedIRData.command);
+
+    if (cmd != CMD_NONE && (millis() - lastIRAccepted >= IR_DEBOUNCE_MS)) {
+      if (pendingCommand == CMD_NONE) {
+        pendingCommand = cmd;
+        lastIRAccepted = millis();
+        Serial.print(F("IR command queued: "));
+        Serial.println(cmd);
+      }
+    }
+  }
+
+  IrReceiver.resume();
+}
+
+uint8_t mapIRToCommand(uint8_t irCode) {
+  if (irCode == IR_CODE_ACTIVATE) return CMD_ACTIVATE;
+  if (irCode == IR_CODE_TOGGLE)   return CMD_TOGGLE;
+  if (irCode == IR_CODE_RESET)    return CMD_RESET;
+  return CMD_NONE;   // every other button is ignored
+}
+
+// =========================================================================
+// DISPLAY
+// =========================================================================
+
+void handleDisplay() {
+  if (!newDataReady) {
+    return;
+  }
+
+  // Copy out of the volatile buffer with interrupts off, so a poll landing
+  // mid-copy cannot hand us half of one packet and half of the next.
+  uint8_t state, mode, lightPct, gasPct;
+  noInterrupts();
+  state    = rxBuffer[0];
+  mode     = rxBuffer[1];
+  lightPct = rxBuffer[2];
+  gasPct   = rxBuffer[3];
+  newDataReady = false;
+  interrupts();
+
+  // Re-render only on an actual change. Without this the LCD is rewritten
+  // every 50 ms, flooding the bus for no visible benefit.
+  if (state == lastState && mode == lastMode &&
+      lightPct == lastLight && gasPct == lastGas) {
+    return;
+  }
+  lastState = state;
+  lastMode  = mode;
+  lastLight = lightPct;
+  lastGas   = gasPct;
+
+  renderState(state, mode, lightPct, gasPct);
+}
+
+void renderState(uint8_t state, uint8_t mode, uint8_t lightPct, uint8_t gasPct) {
+  char buf[17];
+
+  switch (state) {
+    case STANDBY:
+      writeLine(0, "AWAITING RITUAL");
+      writeLine(1, "");
+      break;
+
+    case ACTIVE_MONITORING:
+      writeLine(0, "MONITORING");
+      if (mode == 0) {
+        snprintf(buf, sizeof(buf), "Light: %u%%", lightPct);
+      } else {
+        snprintf(buf, sizeof(buf), "Air Purity:%u%%", gasPct);
+      }
+      writeLine(1, buf);
+      break;
+
+    case GAS_ALERT:
+      writeLine(0, "TOXIC PURGE");
+      writeLine(1, "");
+      break;
+
+    case BLACKOUT_ALERT:
+      writeLine(0, "NOCTIS PROTOCOL");
+      writeLine(1, "");
+      break;
+
+    case TEMP_EMERGENCY:
+      writeLine(0, "COOKED");
+      writeLine(1, "");
+      break;
+
+    case MULTI_FAULT:
+      writeLine(0, ">1 PROBLEMS");
+      writeLine(1, "DETECTED");
+      break;
+
+    // Temperature plus at least one other fault. Not a spec state — added
+    // deliberately. Worded ">1 & TEMP PROBS" / "DETECTED" (15 and 8 chars)
+    // to fit 16x2 and stay parallel with the multi-fault wording above.
+    case TEMP_MULTI_FAULT:
+      writeLine(0, ">1 & TEMP PROBS");
+      writeLine(1, "DETECTED");
+      break;
+
+    default:
+      writeLine(0, "UNKNOWN STATE");
+      writeLine(1, "");
+      break;
+  }
+}
+
+// Writes exactly 16 characters, space-padded.
+void writeLine(uint8_t row, const char* text) {
+  lcd.setCursor(0, row);
+  uint8_t i = 0;
+  while (i < 16 && text[i] != '\0') {
+    lcd.print(text[i]);
+    i++;
+  }
+  while (i < 16) {
+    lcd.print(' ');
+    i++;
+  }
+}
+
